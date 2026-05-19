@@ -97,7 +97,11 @@ class MemberOutput(BaseModel):
     output_text: str
     confidence: float = 70.0
     status: str = "success"
+    failure_reason: str | None = None
+    substitute_for: str | None = None
+    attempts: list[dict[str, Any]] = Field(default_factory=list)
     latency_ms: int = 0
+    cost: float = 0.0
     critiques: list[dict[str, Any]] = Field(default_factory=list)
     revised_text: str | None = None
 

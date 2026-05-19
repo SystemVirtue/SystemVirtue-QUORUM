@@ -22,7 +22,7 @@ class FreeModelRegistry:
         self._cache: list[FreeModel] | None = None
 
     async def refresh(self) -> list[FreeModel]:
-        if not settings.openrouter_api_key or settings.openrouter_api_key.startswith("sk-or-"):
+        if not settings.openrouter_api_key or settings.openrouter_api_key == "sk-or-your-key-here":
             self._cache = self.seed_pool()
             return self._cache
 
@@ -34,6 +34,7 @@ class FreeModelRegistry:
             if float(m.get("pricing", {}).get("prompt", 1)) == 0
             and float(m.get("pricing", {}).get("completion", 1)) == 0
             and int(m.get("context_length", 0)) >= 8192
+            and str(m.get("id", "")).endswith(":free")
             and any(m["id"].startswith(p) for p in self.REPUTABLE_NAMESPACES)
         ]
         self._cache = [await self._enrich(m) for m in free]

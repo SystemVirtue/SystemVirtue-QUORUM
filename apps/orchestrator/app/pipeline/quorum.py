@@ -5,7 +5,7 @@ from app.consensus.engine import consensus, produce_diffs
 from app.core.schemas import ClassificationProfile, CouncilMember, MemberOutput, QuorumResult
 from app.hub.classifier import deterministic_classify
 from app.hub.selection import UserPrefs, select_council
-from app.pipeline.model_client import call_model
+from app.pipeline.model_client import ModelCallError, call_model
 from app.registry.openrouter import FreeModelRegistry
 from app.security.redaction import redact
 
@@ -39,7 +39,7 @@ async def run_quorum(prompt: str, requested_mode: str, options: Any, registry: F
         mode = profile.recommended_mode
     pool = await registry.list_free()
     council = select_council(profile, pool, mode, UserPrefs(banned=options.banned_models, preferred=options.preferred_models))
-    outputs = await generation_stage(prompt, profile, council, mode)
+    outputs = await generation_stage(prompt, profile, council, pool, mode)
 
     if len([o for o in outputs if o.status == "success"]) < MINIMUM_QUORUM[mode]:
         final = degraded_answer(mode, outputs)
@@ -72,23 +72,61 @@ async def run_quorum(prompt: str, requested_mode: str, options: Any, registry: F
     )
 
 
-async def generation_stage(prompt: str, profile: ClassificationProfile, council: list[CouncilMember], mode: str) -> list[MemberOutput]:
-    async def one(member: CouncilMember) -> MemberOutput:
+async def generation_stage(prompt: str, profile: ClassificationProfile, council: list[CouncilMember], free_pool: list[Any], mode: str) -> list[MemberOutput]:
+    used_ids = {member.model.id for member in council}
+    substitute_pool = [model for model in free_pool if model.id not in used_ids and model.health_score >= 0.5]
+
+    async def one(member: CouncilMember, fallback_offset: int) -> MemberOutput:
         role_prompt = (
             f"You are {member.role} in System Virtue QUORUM. "
             "Answer the user request with concrete engineering judgment. "
             "Preserve user requirements, call out uncertainty, and report confidence 0-100."
         )
-        try:
-            text, latency = await asyncio.wait_for(
-                call_model(member.model.id, [{"role": "system", "content": role_prompt}, {"role": "user", "content": prompt}], timeout=30),
-                timeout={"fast": 20, "balanced": 35, "deep": 55, "adversarial": 60, "auditor": 35}.get(mode, 35),
-            )
-            return MemberOutput(label=member.label, role=member.role, model_id=member.model.id, output_text=redact(text), latency_ms=latency)
-        except Exception as exc:
-            return MemberOutput(label=member.label, role=member.role, model_id=member.model.id, output_text="", status="error", latency_ms=0, confidence=0, critiques=[{"error": str(exc)}])
+        timeout = {"fast": 20, "balanced": 35, "deep": 55, "adversarial": 60, "auditor": 35}.get(mode, 35)
+        candidates = [member.model] + substitute_pool[fallback_offset::max(1, len(council))]
+        attempts: list[dict[str, Any]] = []
+        total_latency = 0
+        for idx, model in enumerate(candidates[:3]):
+            try:
+                text, latency, cost, usage = await asyncio.wait_for(
+                    call_model(model.id, [{"role": "system", "content": role_prompt}, {"role": "user", "content": prompt}], timeout=min(timeout, 30), max_tokens=700),
+                    timeout=timeout,
+                )
+                attempts.append({"model": model.id, "status": "success", "latency_ms": latency, "cost": cost})
+                total_latency += latency
+                return MemberOutput(
+                    label=member.label,
+                    role=member.role,
+                    model_id=model.id,
+                    output_text=redact(text),
+                    latency_ms=total_latency,
+                    cost=cost,
+                    substitute_for=member.model.id if idx else None,
+                    attempts=attempts,
+                )
+            except ModelCallError as exc:
+                attempts.append({"model": model.id, "status": "failed", "reason": exc.reason, "status_code": exc.status_code, "latency_ms": exc.latency_ms, "cost": exc.cost})
+                total_latency += exc.latency_ms
+                if exc.reason not in {"rate_limit", "provider_error", "empty_output"}:
+                    break
+            except Exception as exc:
+                attempts.append({"model": model.id, "status": "failed", "reason": type(exc).__name__, "latency_ms": 0, "cost": 0})
+                break
+        reason = attempts[-1]["reason"] if attempts and "reason" in attempts[-1] else "unknown"
+        return MemberOutput(
+            label=member.label,
+            role=member.role,
+            model_id=member.model.id,
+            output_text="",
+            status="error",
+            failure_reason=reason,
+            latency_ms=total_latency,
+            confidence=0,
+            critiques=[{"error": reason}],
+            attempts=attempts,
+        )
 
-    return await asyncio.gather(*(one(member) for member in council))
+    return await asyncio.gather(*(one(member, idx) for idx, member in enumerate(council)))
 
 
 async def critique_stage(prompt: str, outputs: list[MemberOutput], council: list[CouncilMember]) -> None:

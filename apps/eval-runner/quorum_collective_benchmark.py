@@ -128,10 +128,12 @@ def evaluate_content(task: dict[str, Any], content: str) -> bool:
     return all(term in lower for term in task.get("expected_terms", []))
 
 
-async def call_model(client: httpx.AsyncClient, key: str, model: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
-    model_id = model["id"]
-    if not is_free_model(model):
+async def call_model(client: httpx.AsyncClient, key: str, model: dict[str, Any] | str, task: dict[str, Any]) -> dict[str, Any]:
+    model_id = model["id"] if isinstance(model, dict) else model
+    if isinstance(model, dict) and not is_free_model(model):
         raise RuntimeError(f"Blocked non-free model before call: {model_id}")
+    if not isinstance(model, dict) and model_id != "openrouter/free":
+        raise RuntimeError(f"Blocked non-free router before call: {model_id}")
 
     print(f"ACTION call model={model_id} task={task['id']} price_prompt=0 price_completion=0")
     started = time.perf_counter()
@@ -236,6 +238,21 @@ async def run_collective(client: httpx.AsyncClient, key: str, candidates: list[d
     }
 
 
+async def run_baselines(client: httpx.AsyncClient, key: str, candidates: list[dict[str, Any]], task: dict[str, Any]) -> dict[str, Any]:
+    print(f"ACTION baselines task={task['id']} individual_free_models=3 openrouter_free_router=1")
+    individual = [await call_model(client, key, model, task) for model in candidates[:3]]
+    router = await call_model(client, key, "openrouter/free", task)
+    best_individual_ok = any(item["ok"] for item in individual)
+    print(f"RESULT baselines task={task['id']} best_individual_ok={best_individual_ok} openrouter_free_ok={router['ok']}")
+    return {
+        "task_id": task["id"],
+        "individual_free_top3": individual,
+        "best_individual_ok": best_individual_ok,
+        "openrouter_free": router,
+        "reported_cost_usd": sum(float(item.get("cost") or 0) for item in individual) + float(router.get("cost") or 0),
+    }
+
+
 def pctl(values: list[int], percentile: float) -> float | None:
     if not values:
         return None
@@ -246,6 +263,11 @@ def pctl(values: list[int], percentile: float) -> float | None:
 
 def summarise(report: dict[str, Any]) -> dict[str, Any]:
     member_results = [item for collective in report["collective_results"] for item in collective["member_results"]]
+    baseline_results = [
+        item
+        for baseline in report.get("baseline_results", [])
+        for item in baseline["individual_free_top3"] + [baseline["openrouter_free"]]
+    ]
     latencies = [item["latency_ms"] for item in member_results if item["ok"]]
     failures: dict[str, int] = {}
     for item in member_results:
@@ -264,6 +286,9 @@ def summarise(report: dict[str, Any]) -> dict[str, Any]:
         },
         "failure_reasons": failures,
         "total_reported_cost_usd": sum(float(item.get("cost") or 0) for item in member_results),
+        "baseline_reported_cost_usd": sum(float(item.get("cost") or 0) for item in baseline_results),
+        "openrouter_free_success_rate": sum(1 for item in report.get("baseline_results", []) if item["openrouter_free"]["ok"]) / max(1, len(report.get("baseline_results", []))),
+        "best_individual_top3_success_rate": sum(1 for item in report.get("baseline_results", []) if item["best_individual_ok"]) / max(1, len(report.get("baseline_results", []))),
         "total_fallbacks": sum(item["fallback_count"] for item in report["collective_results"]),
     }
 
@@ -289,13 +314,29 @@ def write_markdown(report: dict[str, Any], summary: dict[str, Any], path: Path) 
         f"- Member success rate: `{summary['member_success_rate']:.2%}`",
         f"- Total fallbacks/substitutions: `{summary['total_fallbacks']}`",
         f"- Total reported cost: `${summary['total_reported_cost_usd']:.2f}`",
+        f"- Baseline reported cost: `${summary['baseline_reported_cost_usd']:.2f}`",
+        f"- Best individual top-3 success rate: `{summary['best_individual_top3_success_rate']:.2%}`",
+        f"- `openrouter/free` success rate: `{summary['openrouter_free_success_rate']:.2%}`",
         f"- Successful latency median: `{summary['successful_member_latency_ms']['median']}` ms",
         f"- Successful latency p95: `{summary['successful_member_latency_ms']['p95']}` ms",
         f"- Failure reasons: `{json.dumps(summary['failure_reasons'], sort_keys=True)}`",
         "",
-        "## Collective Results",
+        "## Baseline Results",
         "",
     ]
+    for baseline in report.get("baseline_results", []):
+        lines.extend([
+            f"### {baseline['task_id']}",
+            "",
+            f"- Best top-3 individual free model succeeded: `{baseline['best_individual_ok']}`",
+            f"- `openrouter/free` succeeded: `{baseline['openrouter_free']['ok']}`",
+            f"- Reported baseline cost: `${baseline['reported_cost_usd']:.2f}`",
+            "",
+        ])
+    lines.extend([
+        "## Collective Results",
+        "",
+    ])
     for collective in report["collective_results"]:
         lines.extend([
             f"### {collective['task_id']}",
@@ -346,6 +387,10 @@ async def main() -> int:
             await run_collective(client, key, candidates, task, args.max_attempts)
             for task in TASKS
         ]
+        baseline_results = [
+            await run_baselines(client, key, candidates, task)
+            for task in TASKS
+        ]
 
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -353,6 +398,7 @@ async def main() -> int:
         "free_pool_count": len(free_models),
         "candidate_order": [model["id"] for model in candidates[:args.max_attempts]],
         "collective_results": collective_results,
+        "baseline_results": baseline_results,
     }
     summary = summarise(report)
     report["summary"] = summary
