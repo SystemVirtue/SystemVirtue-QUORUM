@@ -25,6 +25,7 @@ build/
 *.db
 *.sqlite
 pgdata/
+benchmarks/runs/*.json
 
 # Logs
 *.log
