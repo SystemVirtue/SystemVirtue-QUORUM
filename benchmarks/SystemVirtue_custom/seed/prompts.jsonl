@@ -1,0 +1,20 @@
+{"id":"seed-001","prompt":"Implement a Python function that deduplicates a list while preserving order and add tests."}
+{"id":"seed-002","prompt":"Debug this TypeScript bug: const total = items.map(i => i.price).reduce((a,b)=>a+b); fails for empty arrays."}
+{"id":"seed-003","prompt":"Review an auth middleware for missing bearer token handling and injection risks."}
+{"id":"seed-004","prompt":"Design a safe PostgreSQL migration plan for splitting a full_name column into first_name and last_name."}
+{"id":"seed-005","prompt":"Refactor a Go HTTP handler to separate validation, persistence, and response mapping."}
+{"id":"seed-006","prompt":"Write tests for a Rust parser that must reject unterminated quoted strings."}
+{"id":"seed-007","prompt":"Explain why an async Python task queue can lose jobs during shutdown and propose a fix."}
+{"id":"seed-008","prompt":"Find edge cases in a billing proration function that uses integer cents."}
+{"id":"seed-009","prompt":"Create a Docker Compose troubleshooting checklist for Redis connection failures."}
+{"id":"seed-010","prompt":"Implement SQL to find duplicate emails case-insensitively and propose an index."}
+{"id":"seed-011","prompt":"Architecture review: should a monolith split background jobs into a separate service?"}
+{"id":"seed-012","prompt":"Security review: identify CSRF and session fixation risks in a login flow."}
+{"id":"seed-013","prompt":"Generate TypeScript types and validation for a webhook payload."}
+{"id":"seed-014","prompt":"Debug a flaky test caused by shared mutable state."}
+{"id":"seed-015","prompt":"Write a rollback plan for a production schema migration."}
+{"id":"seed-016","prompt":"Compare queue retry strategies for idempotent email sending."}
+{"id":"seed-017","prompt":"Audit code that logs request headers for secret leakage."}
+{"id":"seed-018","prompt":"Implement a small LRU cache in Python with tests."}
+{"id":"seed-019","prompt":"Review a React state update that mutates nested arrays."}
+{"id":"seed-020","prompt":"Create a benchmark plan comparing one free model against a 4-model council."}

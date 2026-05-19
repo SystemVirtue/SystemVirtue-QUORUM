@@ -1,0 +1,30 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Environment and local secrets
+.env
+*.local
+
+# Node and frontend build output
+node_modules/
+dist/
+build/
+.svelte-kit/
+.next/
+
+# Databases and generated state
+*.db
+*.sqlite
+pgdata/
+
+# Logs
+*.log

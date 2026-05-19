@@ -1,0 +1,5 @@
+services:
+  orchestrator:
+    environment:
+      ALLOW_PAID_MODELS: ${ALLOW_PAID_MODELS:-false}
+      DEPLOYMENT_MODE: hosted

@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: SystemVirtue
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-SystemVirtue}
+      POSTGRES_DB: SystemVirtue
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U SystemVirtue"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  orchestrator:
+    build: ./apps/orchestrator
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      DATABASE_URL: postgresql://SystemVirtue:${POSTGRES_PASSWORD:-SystemVirtue}@postgres:5432/SystemVirtue
+      REDIS_URL: redis://redis:6379/0
+      DEFAULT_QUORUM_MODE: balanced
+      DEFAULT_HUB_MODEL: qwen/qwen2.5-72b-instruct:free
+      ALLOW_PAID_MODELS: "false"
+      BYOK_ENCRYPTION_KEY: ${BYOK_ENCRYPTION_KEY}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    ports: ["8080:8080"]
+
+  worker:
+    build: ./apps/worker
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      DATABASE_URL: postgresql://SystemVirtue:${POSTGRES_PASSWORD:-SystemVirtue}@postgres:5432/SystemVirtue
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      orchestrator: { condition: service_started }
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    volumes:
+      - ./apps/litellm/config.yaml:/app/config.yaml
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-SystemVirtue-local}
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    depends_on:
+      orchestrator: { condition: service_started }
+    ports: ["4000:4000"]
+
+  webui:
+    build: ./apps/webui
+    environment:
+      OPENAI_API_BASE_URL: http://litellm:4000/v1
+      OPENAI_API_KEY: ${LITELLM_MASTER_KEY:-sk-SystemVirtue-local}
+      SystemVirtue_API_URL: http://orchestrator:8080
+      SystemVirtue_WS_URL: ws://orchestrator:8080/ws
+    depends_on:
+      litellm: { condition: service_started }
+    ports: ["3000:8080"]
+
+volumes:
+  pgdata:

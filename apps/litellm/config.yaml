@@ -1,0 +1,34 @@
+model_list:
+  - model_name: SystemVirtue/quorum-free-fast
+    litellm_params:
+      model: openai/SystemVirtue/quorum-free-fast
+      api_base: http://orchestrator:8080/v1
+      api_key: os.environ/LITELLM_MASTER_KEY
+  - model_name: SystemVirtue/quorum-free-balanced
+    litellm_params:
+      model: openai/SystemVirtue/quorum-free-balanced
+      api_base: http://orchestrator:8080/v1
+      api_key: os.environ/LITELLM_MASTER_KEY
+  - model_name: SystemVirtue/quorum-free-deep
+    litellm_params:
+      model: openai/SystemVirtue/quorum-free-deep
+      api_base: http://orchestrator:8080/v1
+      api_key: os.environ/LITELLM_MASTER_KEY
+  - model_name: SystemVirtue/quorum-free-adversarial
+    litellm_params:
+      model: openai/SystemVirtue/quorum-free-adversarial
+      api_base: http://orchestrator:8080/v1
+      api_key: os.environ/LITELLM_MASTER_KEY
+  - model_name: SystemVirtue/quorum-free-auditor
+    litellm_params:
+      model: openai/SystemVirtue/quorum-free-auditor
+      api_base: http://orchestrator:8080/v1
+      api_key: os.environ/LITELLM_MASTER_KEY
+  - model_name: SystemVirtue/single-free-best
+    litellm_params:
+      model: openai/SystemVirtue/single-free-best
+      api_base: http://orchestrator:8080/v1
+      api_key: os.environ/LITELLM_MASTER_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

@@ -1,0 +1,22 @@
+{
+  "deepseek/": {
+    "coding_strength": {"python": 9.0, "typescript": 8.6, "javascript": 8.5, "rust": 7.7, "go": 8.0, "sql": 8.2, "general": 8.6},
+    "reasoning": 8.2, "math": 7.8, "long_context": 7.4, "tool_use": 6.6, "critique": 8.0, "synthesis": 7.7, "json_reliability": 8.7, "model_class": "coder",
+    "generic": {"coding": 8.6, "reasoning": 8.2, "critique": 8.0, "synthesis": 7.7, "json_reliability": 8.7, "long_context": 7.4, "typescript": 8.6, "python": 9.0, "sql": 8.2, "devops": 7.2, "security": 7.8}
+  },
+  "qwen/": {
+    "coding_strength": {"python": 8.8, "typescript": 8.7, "javascript": 8.5, "rust": 7.6, "go": 7.9, "sql": 8.0, "general": 8.5},
+    "reasoning": 8.1, "math": 8.0, "long_context": 7.8, "tool_use": 6.8, "critique": 7.9, "synthesis": 8.0, "json_reliability": 9.0, "model_class": "coder",
+    "generic": {"coding": 8.5, "reasoning": 8.1, "critique": 7.9, "synthesis": 8.0, "json_reliability": 9.0, "long_context": 7.8, "typescript": 8.7, "python": 8.8, "sql": 8.0, "devops": 7.3, "security": 7.6}
+  },
+  "meta-llama/": {
+    "coding_strength": {"python": 7.8, "typescript": 7.4, "javascript": 7.4, "rust": 7.0, "go": 7.1, "sql": 7.2, "general": 7.5},
+    "reasoning": 8.7, "math": 7.6, "long_context": 7.2, "tool_use": 6.2, "critique": 8.4, "synthesis": 8.1, "json_reliability": 7.7, "model_class": "reasoner",
+    "generic": {"coding": 7.5, "reasoning": 8.7, "critique": 8.4, "synthesis": 8.1, "json_reliability": 7.7, "long_context": 7.2, "typescript": 7.4, "python": 7.8, "sql": 7.2, "devops": 7.1, "security": 8.0}
+  },
+  "google/": {
+    "coding_strength": {"python": 7.6, "typescript": 7.5, "javascript": 7.6, "rust": 6.8, "go": 7.0, "sql": 7.0, "general": 7.4},
+    "reasoning": 8.0, "math": 7.4, "long_context": 8.0, "tool_use": 7.0, "critique": 7.7, "synthesis": 8.2, "json_reliability": 8.0, "model_class": "generalist",
+    "generic": {"coding": 7.4, "reasoning": 8.0, "critique": 7.7, "synthesis": 8.2, "json_reliability": 8.0, "long_context": 8.0, "typescript": 7.5, "python": 7.6, "sql": 7.0, "devops": 7.2, "security": 7.3}
+  }
+}

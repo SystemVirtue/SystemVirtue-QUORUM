@@ -1,0 +1,8 @@
+{
+  "deepseek/deepseek-chat-v3": "coder",
+  "qwen/qwen-2.5-coder": "coder",
+  "meta-llama/llama-3.3": "reasoner",
+  "google/gemini": "generalist",
+  "mistralai/": "generalist",
+  "openrouter/auto": "generalist"
+}
