@@ -93,16 +93,19 @@ async def probe_model(client: httpx.AsyncClient, key: str, model: dict[str, Any]
             "temperature": 0,
         }
         try:
-            response = await client.post(
-                f"{OPENROUTER_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://systemvirtue.local",
-                    "X-Title": "System Virtue Free Model Census",
-                },
-                json=payload,
-                timeout=timeout,
+            response = await asyncio.wait_for(
+                client.post(
+                    f"{OPENROUTER_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://systemvirtue.local",
+                        "X-Title": "System Virtue Free Model Census",
+                    },
+                    json=payload,
+                    timeout=timeout,
+                ),
+                timeout=timeout + 1,
             )
             latency_ms = int((time.perf_counter() - started) * 1000)
             try:
@@ -130,9 +133,9 @@ async def probe_model(client: httpx.AsyncClient, key: str, model: dict[str, Any]
                 "cost": cost,
                 "anomalies": flags,
             }
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        except (asyncio.TimeoutError, httpx.TimeoutException, httpx.NetworkError) as exc:
             latency_ms = int((time.perf_counter() - started) * 1000)
-            flags = [type(exc).__name__]
+            flags = ["hard_timeout" if isinstance(exc, asyncio.TimeoutError) else type(exc).__name__]
             print(f"RESULT probe model={model_id} status=None ok=False latency_ms={latency_ms} cost=0 anomalies={','.join(flags)}")
             return {
                 "id": model_id,

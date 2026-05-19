@@ -28,6 +28,7 @@ pgdata/
 benchmarks/runs/*.json
 benchmarks/reports/*.json
 benchmarks/reports/*.md
+benchmarks/series/
 
 # Logs
 *.log
