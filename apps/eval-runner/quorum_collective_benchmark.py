@@ -203,19 +203,37 @@ async def call_model(client: httpx.AsyncClient, key: str, model: dict[str, Any] 
 
 
 async def run_collective(client: httpx.AsyncClient, key: str, candidates: list[dict[str, Any]], task: dict[str, Any], max_attempts: int) -> dict[str, Any]:
-    print(f"ACTION collective task={task['id']} mode={task['mode']} target={task['council_size']} min_quorum={task['minimum_quorum']} max_attempts={max_attempts}")
+    print(f"ACTION collective task={task['id']} mode={task['mode']} target={task['council_size']} min_quorum={task['minimum_quorum']} max_attempts={max_attempts} execution=parallel_waves")
     attempted: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
+    waves: list[dict[str, Any]] = []
     started = time.perf_counter()
-    for model in candidates[:max_attempts]:
-        attempted.append(model)
-        result = await call_model(client, key, model, task)
-        results.append(result)
+    cursor = 0
+    wave_index = 1
+    while cursor < min(max_attempts, len(candidates)):
         successes = sum(1 for item in results if item["ok"])
-        if successes >= task["council_size"]:
-            break
         if len(results) >= task["council_size"] and successes >= task["minimum_quorum"]:
             break
+        needed = task["council_size"] if not results else max(1, task["minimum_quorum"] - successes)
+        batch = candidates[cursor:min(cursor + needed, max_attempts, len(candidates))]
+        cursor += len(batch)
+        if not batch:
+            break
+        attempted.extend(batch)
+        print(f"ACTION collective_wave task={task['id']} wave={wave_index} models=" + ",".join(model["id"] for model in batch))
+        wave_started = time.perf_counter()
+        wave_results = await asyncio.gather(*(call_model(client, key, model, task) for model in batch))
+        wave_wall_clock_ms = int((time.perf_counter() - wave_started) * 1000)
+        results.extend(wave_results)
+        waves.append({
+            "wave": wave_index,
+            "models": [model["id"] for model in batch],
+            "wall_clock_ms": wave_wall_clock_ms,
+            "successes": sum(1 for item in wave_results if item["ok"]),
+            "failures": sum(1 for item in wave_results if not item["ok"]),
+        })
+        print(f"RESULT collective_wave task={task['id']} wave={wave_index} successes={waves[-1]['successes']} failures={waves[-1]['failures']} wall_clock_ms={wave_wall_clock_ms}")
+        wave_index += 1
     wall_clock_ms = int((time.perf_counter() - started) * 1000)
     successes = [item for item in results if item["ok"]]
     failures = [item for item in results if not item["ok"]]
@@ -232,6 +250,8 @@ async def run_collective(client: httpx.AsyncClient, key: str, candidates: list[d
         "successful_members": len(successes),
         "failed_members": len(failures),
         "fallback_count": fallback_count,
+        "wave_count": len(waves),
+        "waves": waves,
         "wall_clock_ms": wall_clock_ms,
         "member_results": results,
         "marginal_cost_usd": sum(float(item.get("cost") or 0) for item in results),
@@ -239,8 +259,10 @@ async def run_collective(client: httpx.AsyncClient, key: str, candidates: list[d
 
 
 async def run_baselines(client: httpx.AsyncClient, key: str, candidates: list[dict[str, Any]], task: dict[str, Any]) -> dict[str, Any]:
-    print(f"ACTION baselines task={task['id']} individual_free_models=3 openrouter_free_router=1")
-    individual = [await call_model(client, key, model, task) for model in candidates[:3]]
+    print(f"ACTION baselines task={task['id']} individual_free_models=3 openrouter_free_router=1 execution=parallel_top3")
+    baseline_started = time.perf_counter()
+    individual = await asyncio.gather(*(call_model(client, key, model, task) for model in candidates[:3]))
+    individual_wall_clock_ms = int((time.perf_counter() - baseline_started) * 1000)
     router = await call_model(client, key, "openrouter/free", task)
     best_individual_ok = any(item["ok"] for item in individual)
     print(f"RESULT baselines task={task['id']} best_individual_ok={best_individual_ok} openrouter_free_ok={router['ok']}")
@@ -248,6 +270,7 @@ async def run_baselines(client: httpx.AsyncClient, key: str, candidates: list[di
         "task_id": task["id"],
         "individual_free_top3": individual,
         "best_individual_ok": best_individual_ok,
+        "individual_top3_wall_clock_ms": individual_wall_clock_ms,
         "openrouter_free": router,
         "reported_cost_usd": sum(float(item.get("cost") or 0) for item in individual) + float(router.get("cost") or 0),
     }
@@ -290,7 +313,36 @@ def summarise(report: dict[str, Any]) -> dict[str, Any]:
         "openrouter_free_success_rate": sum(1 for item in report.get("baseline_results", []) if item["openrouter_free"]["ok"]) / max(1, len(report.get("baseline_results", []))),
         "best_individual_top3_success_rate": sum(1 for item in report.get("baseline_results", []) if item["best_individual_ok"]) / max(1, len(report.get("baseline_results", []))),
         "total_fallbacks": sum(item["fallback_count"] for item in report["collective_results"]),
+        "collective_wall_clock_ms": {
+            "median": statistics.median([item["wall_clock_ms"] for item in report["collective_results"]]),
+            "max": max(item["wall_clock_ms"] for item in report["collective_results"]),
+        },
+        "collective_wave_count": {
+            "median": statistics.median([item["wave_count"] for item in report["collective_results"]]),
+            "max": max(item["wave_count"] for item in report["collective_results"]),
+        },
+        "per_model": per_model_summary(member_results + baseline_results),
     }
+
+
+def per_model_summary(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    for item in results:
+        model_id = item["requested_model"]
+        row = summary.setdefault(model_id, {"attempts": 0, "successes": 0, "failures": 0, "failure_reasons": {}, "latencies_ms": []})
+        row["attempts"] += 1
+        row["latencies_ms"].append(item["latency_ms"])
+        if item["ok"]:
+            row["successes"] += 1
+        else:
+            row["failures"] += 1
+            reason = item["failure_reason"] or "unknown"
+            row["failure_reasons"][reason] = row["failure_reasons"].get(reason, 0) + 1
+    for row in summary.values():
+        row["success_rate"] = row["successes"] / max(1, row["attempts"])
+        row["median_latency_ms"] = statistics.median(row["latencies_ms"])
+        del row["latencies_ms"]
+    return dict(sorted(summary.items(), key=lambda item: (-item[1]["attempts"], item[0])))
 
 
 def write_markdown(report: dict[str, Any], summary: dict[str, Any], path: Path) -> None:
@@ -317,6 +369,9 @@ def write_markdown(report: dict[str, Any], summary: dict[str, Any], path: Path) 
         f"- Baseline reported cost: `${summary['baseline_reported_cost_usd']:.2f}`",
         f"- Best individual top-3 success rate: `{summary['best_individual_top3_success_rate']:.2%}`",
         f"- `openrouter/free` success rate: `{summary['openrouter_free_success_rate']:.2%}`",
+        f"- Collective wall-clock median: `{summary['collective_wall_clock_ms']['median']}` ms",
+        f"- Collective wall-clock max: `{summary['collective_wall_clock_ms']['max']}` ms",
+        f"- Collective wave-count median: `{summary['collective_wave_count']['median']}`",
         f"- Successful latency median: `{summary['successful_member_latency_ms']['median']}` ms",
         f"- Successful latency p95: `{summary['successful_member_latency_ms']['p95']}` ms",
         f"- Failure reasons: `{json.dumps(summary['failure_reasons'], sort_keys=True)}`",
@@ -330,7 +385,8 @@ def write_markdown(report: dict[str, Any], summary: dict[str, Any], path: Path) 
             "",
             f"- Best top-3 individual free model succeeded: `{baseline['best_individual_ok']}`",
             f"- `openrouter/free` succeeded: `{baseline['openrouter_free']['ok']}`",
-            f"- Reported baseline cost: `${baseline['reported_cost_usd']:.2f}`",
+        f"- Reported baseline cost: `${baseline['reported_cost_usd']:.2f}`",
+            f"- Parallel top-3 wall clock: `{baseline['individual_top3_wall_clock_ms']}` ms",
             "",
         ])
     lines.extend([
@@ -348,6 +404,7 @@ def write_markdown(report: dict[str, Any], summary: dict[str, Any], path: Path) 
             f"- Successful members: `{collective['successful_members']}`",
             f"- Failed members: `{collective['failed_members']}`",
             f"- Fallback count: `{collective['fallback_count']}`",
+            f"- Wave count: `{collective['wave_count']}`",
             f"- Wall clock: `{collective['wall_clock_ms']}` ms",
             f"- Reported cost: `${collective['marginal_cost_usd']:.2f}`",
             "",
@@ -361,6 +418,18 @@ def write_markdown(report: dict[str, Any], summary: dict[str, Any], path: Path) 
                 f"`{member['latency_ms']}` | `{member['cost']}` | `{member['failure_reason'] or ''}` | {preview} |"
             )
         lines.append("")
+    lines.extend([
+        "## Per-Model Reliability",
+        "",
+        "| Model | Attempts | Successes | Success Rate | Median Latency ms | Failure Reasons |",
+        "|---|---:|---:|---:|---:|---|",
+    ])
+    for model_id, row in summary["per_model"].items():
+        lines.append(
+            f"| `{model_id}` | `{row['attempts']}` | `{row['successes']}` | "
+            f"`{row['success_rate']:.2%}` | `{row['median_latency_ms']}` | "
+            f"`{json.dumps(row['failure_reasons'], sort_keys=True)}` |"
+        )
     path.write_text("\n".join(lines))
 
 
