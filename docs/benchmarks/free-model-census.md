@@ -5,7 +5,13 @@ The free model census measures live OpenRouter `:free` model behavior over time.
 ## One-Shot Census
 
 ```bash
-python apps/eval-runner/query_all_free_models.py --concurrency 4 --timeout 60
+python apps/eval-runner/query_all_free_models.py \
+  --concurrency 1 \
+  --request-spacing-seconds 3.1 \
+  --timeout 90 \
+  --standard-max-tokens 512 \
+  --reasoning-max-tokens 0 \
+  --retry-on-rate-limit
 ```
 
 Outputs:
@@ -21,8 +27,12 @@ For 100 one-minute intervals:
 python apps/eval-runner/scheduled_free_model_census.py \
   --iterations 100 \
   --interval-seconds 60 \
-  --concurrency 8 \
-  --timeout 20 \
+  --concurrency 1 \
+  --request-spacing-seconds 3.1 \
+  --timeout 90 \
+  --standard-max-tokens 512 \
+  --reasoning-max-tokens 0 \
+  --retry-on-rate-limit \
   --run-id free_census_100min_$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -41,8 +51,12 @@ To resume an interrupted run without duplicating completed iterations:
 python apps/eval-runner/scheduled_free_model_census.py \
   --iterations 100 \
   --interval-seconds 60 \
-  --concurrency 8 \
-  --timeout 20 \
+  --concurrency 1 \
+  --request-spacing-seconds 3.1 \
+  --timeout 90 \
+  --standard-max-tokens 512 \
+  --reasoning-max-tokens 0 \
+  --retry-on-rate-limit \
   --run-id <existing-run-id> \
   --resume
 ```
@@ -81,7 +95,23 @@ For selection health, `availability_24h` is exported as usable exact-probe succe
 - Fetches live OpenRouter `/models`.
 - Calls only models where OpenRouter reports `prompt=0`, `completion=0`, and the model id ends with `:free`.
 - Uses a hard per-call timeout to keep the minute cadence from being held hostage by one slow endpoint.
+- Defaults to one request at a time with `3.1s` spacing to stay below OpenRouter's documented free-model `20 RPM` limit.
+- Retries one `429` after OpenRouter's `Retry-After` delay when `--retry-on-rate-limit` is enabled.
+- Allocates maximum advertised completion budgets to reasoning/thinking models when OpenRouter exposes a provider cap, keeping a 1024-token prompt/context reserve to avoid context-length 400s; otherwise falls back to `4096` because hidden reasoning tokens can consume small completions.
 - Flags any nonzero reported cost.
+
+## OpenRouter Interaction Plan
+
+Based on OpenRouter's docs:
+
+- Call `/api/v1/key` before long runs to inspect key limits and remaining quota.
+- Keep default free-model request rate below `20 RPM`; use `3.1s` spacing and avoid parallel fan-out except for tiny smoke checks.
+- Treat `429` and `503` as backoff signals. Honor the `Retry-After` header or error metadata, retry once, and then mark the model as temporarily rate-limited.
+- Track daily request count because failed attempts still count toward the free-model daily quota.
+- Keep strict free-only validation before every call: live `/models` must report prompt and completion price `0`, and the model id must end in `:free`.
+- For reasoning/thinking models, use high completion budgets by default. OpenRouter's reasoning examples use large `max_output_tokens`; tiny exact probes can falsely classify these models as empty-output failures.
+- Distinguish hard provider failures (`404`, `502`, repeated timeout) from temporary upstream limits (`429`) in health scoring.
+- Prefer fewer high-quality model candidates for QUORUM over broad all-model sweeps; all-model sweeps are diagnostic only and should be paced conservatively.
 
 ## Interpreting The Data
 

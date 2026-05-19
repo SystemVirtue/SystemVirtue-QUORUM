@@ -11,6 +11,8 @@ from typing import Any
 
 import httpx
 
+from query_all_free_models import RequestPacer, is_reasoning_model, max_tokens_for_model, retry_after_seconds
+
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 REPUTABLE_NAMESPACES = (
@@ -128,7 +130,16 @@ def evaluate_content(task: dict[str, Any], content: str) -> bool:
     return all(term in lower for term in task.get("expected_terms", []))
 
 
-async def call_model(client: httpx.AsyncClient, key: str, model: dict[str, Any] | str, task: dict[str, Any]) -> dict[str, Any]:
+async def call_model(
+    client: httpx.AsyncClient,
+    key: str,
+    model: dict[str, Any] | str,
+    task: dict[str, Any],
+    pacer: RequestPacer | None = None,
+    standard_max_tokens: int = 1024,
+    reasoning_max_tokens: int = 4096,
+    retry_on_rate_limit: bool = True,
+) -> dict[str, Any]:
     model_id = model["id"] if isinstance(model, dict) else model
     if isinstance(model, dict) and not is_free_model(model):
         raise RuntimeError(f"Blocked non-free model before call: {model_id}")
@@ -137,28 +148,47 @@ async def call_model(client: httpx.AsyncClient, key: str, model: dict[str, Any] 
 
     print(f"ACTION call model={model_id} task={task['id']} price_prompt=0 price_completion=0")
     started = time.perf_counter()
+    max_tokens = (
+        max_tokens_for_model(model, max(task["max_tokens"], standard_max_tokens), reasoning_max_tokens)
+        if isinstance(model, dict)
+        else task["max_tokens"]
+    )
     payload = {
         "model": model_id,
         "messages": [{"role": "user", "content": task["prompt"]}],
-        "max_tokens": task["max_tokens"],
+        "max_tokens": max_tokens,
         "temperature": 0,
     }
     try:
-        response = await client.post(
-            f"{OPENROUTER_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://systemvirtue.local",
-                "X-Title": "System Virtue QUORUM Free Benchmark",
-            },
-            json=payload,
-        )
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        try:
-            data = response.json()
-        except Exception:
-            data = {"raw": response.text}
+        data: dict[str, Any] = {}
+        response: httpx.Response | None = None
+        elapsed_ms = 0
+        retry_attempted = False
+        for attempt in range(2 if retry_on_rate_limit else 1):
+            if pacer:
+                await pacer.wait()
+            response = await client.post(
+                f"{OPENROUTER_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://systemvirtue.local",
+                    "X-Title": "System Virtue QUORUM Free Benchmark",
+                },
+                json=payload,
+            )
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            try:
+                data = response.json()
+            except Exception:
+                data = {"raw": response.text}
+            wait_for = retry_after_seconds(response, data)
+            if response.status_code == 429 and wait_for and attempt == 0 and retry_on_rate_limit:
+                retry_attempted = True
+                await asyncio.sleep(wait_for)
+                continue
+            break
+        assert response is not None
         content = data.get("choices", [{}])[0].get("message", {}).get("content") or ""
         usage = data.get("usage", {})
         cost = usage.get("cost", usage.get("cost_details", {}).get("upstream_inference_cost", 0))
@@ -184,6 +214,10 @@ async def call_model(client: httpx.AsyncClient, key: str, model: dict[str, Any] 
             "content_preview": content.replace("\n", " ")[:500],
             "cost": cost,
             "usage": usage,
+            "max_tokens": max_tokens,
+            "reasoning_model": is_reasoning_model(model) if isinstance(model, dict) else False,
+            "retry_after_seconds": retry_after_seconds(response, data),
+            "retry_attempted": retry_attempted,
         }
     except (httpx.TimeoutException, httpx.NetworkError) as exc:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -199,10 +233,24 @@ async def call_model(client: httpx.AsyncClient, key: str, model: dict[str, Any] 
             "content_preview": "",
             "cost": 0,
             "usage": {},
+            "max_tokens": max_tokens if "max_tokens" in locals() else task["max_tokens"],
+            "reasoning_model": is_reasoning_model(model) if isinstance(model, dict) else False,
+            "retry_after_seconds": None,
+            "retry_attempted": False,
         }
 
 
-async def run_collective(client: httpx.AsyncClient, key: str, candidates: list[dict[str, Any]], task: dict[str, Any], max_attempts: int) -> dict[str, Any]:
+async def run_collective(
+    client: httpx.AsyncClient,
+    key: str,
+    candidates: list[dict[str, Any]],
+    task: dict[str, Any],
+    max_attempts: int,
+    pacer: RequestPacer,
+    standard_max_tokens: int,
+    reasoning_max_tokens: int,
+    retry_on_rate_limit: bool,
+) -> dict[str, Any]:
     print(f"ACTION collective task={task['id']} mode={task['mode']} target={task['council_size']} min_quorum={task['minimum_quorum']} max_attempts={max_attempts} execution=parallel_waves")
     attempted: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
@@ -222,7 +270,10 @@ async def run_collective(client: httpx.AsyncClient, key: str, candidates: list[d
         attempted.extend(batch)
         print(f"ACTION collective_wave task={task['id']} wave={wave_index} models=" + ",".join(model["id"] for model in batch))
         wave_started = time.perf_counter()
-        wave_results = await asyncio.gather(*(call_model(client, key, model, task) for model in batch))
+        wave_results = await asyncio.gather(*(
+            call_model(client, key, model, task, pacer, standard_max_tokens, reasoning_max_tokens, retry_on_rate_limit)
+            for model in batch
+        ))
         wave_wall_clock_ms = int((time.perf_counter() - wave_started) * 1000)
         results.extend(wave_results)
         waves.append({
@@ -258,12 +309,24 @@ async def run_collective(client: httpx.AsyncClient, key: str, candidates: list[d
     }
 
 
-async def run_baselines(client: httpx.AsyncClient, key: str, candidates: list[dict[str, Any]], task: dict[str, Any]) -> dict[str, Any]:
+async def run_baselines(
+    client: httpx.AsyncClient,
+    key: str,
+    candidates: list[dict[str, Any]],
+    task: dict[str, Any],
+    pacer: RequestPacer,
+    standard_max_tokens: int,
+    reasoning_max_tokens: int,
+    retry_on_rate_limit: bool,
+) -> dict[str, Any]:
     print(f"ACTION baselines task={task['id']} individual_free_models=3 openrouter_free_router=1 execution=parallel_top3")
     baseline_started = time.perf_counter()
-    individual = await asyncio.gather(*(call_model(client, key, model, task) for model in candidates[:3]))
+    individual = await asyncio.gather(*(
+        call_model(client, key, model, task, pacer, standard_max_tokens, reasoning_max_tokens, retry_on_rate_limit)
+        for model in candidates[:3]
+    ))
     individual_wall_clock_ms = int((time.perf_counter() - baseline_started) * 1000)
-    router = await call_model(client, key, "openrouter/free", task)
+    router = await call_model(client, key, "openrouter/free", task, pacer, standard_max_tokens, reasoning_max_tokens, retry_on_rate_limit)
     best_individual_ok = any(item["ok"] for item in individual)
     print(f"RESULT baselines task={task['id']} best_individual_ok={best_individual_ok} openrouter_free_ok={router['ok']}")
     return {
@@ -436,6 +499,10 @@ def write_markdown(report: dict[str, Any], summary: dict[str, Any], path: Path) 
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Free-only QUORUM collective benchmark")
     parser.add_argument("--max-attempts", type=int, default=8)
+    parser.add_argument("--request-spacing-seconds", type=float, default=3.1)
+    parser.add_argument("--standard-max-tokens", type=int, default=1024)
+    parser.add_argument("--reasoning-max-tokens", type=int, default=0, help="Reasoning model budget. 0 uses the provider's advertised max completion cap when available, else 4096.")
+    parser.add_argument("--retry-on-rate-limit", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[2]
@@ -451,13 +518,22 @@ async def main() -> int:
     async with httpx.AsyncClient(timeout=45) as client:
         free_models = await fetch_free_models(client, key)
         candidates = diverse_candidates(free_models)
+        pacer = RequestPacer(args.request_spacing_seconds)
         print("ACTION candidate_order " + ", ".join(model["id"] for model in candidates[:args.max_attempts]))
         collective_results = [
-            await run_collective(client, key, candidates, task, args.max_attempts)
+            await run_collective(
+                client, key, candidates, task, args.max_attempts, pacer,
+                args.standard_max_tokens, args.reasoning_max_tokens,
+                args.retry_on_rate_limit,
+            )
             for task in TASKS
         ]
         baseline_results = [
-            await run_baselines(client, key, candidates, task)
+            await run_baselines(
+                client, key, candidates, task, pacer,
+                args.standard_max_tokens, args.reasoning_max_tokens,
+                args.retry_on_rate_limit,
+            )
             for task in TASKS
         ]
 
@@ -466,6 +542,12 @@ async def main() -> int:
         "benchmark": "quorum_collective_free_tier",
         "free_pool_count": len(free_models),
         "candidate_order": [model["id"] for model in candidates[:args.max_attempts]],
+        "openrouter_policy": {
+            "request_spacing_seconds": args.request_spacing_seconds,
+            "standard_max_tokens": args.standard_max_tokens,
+            "reasoning_max_tokens": args.reasoning_max_tokens,
+            "retry_on_rate_limit": args.retry_on_rate_limit,
+        },
         "collective_results": collective_results,
         "baseline_results": baseline_results,
     }

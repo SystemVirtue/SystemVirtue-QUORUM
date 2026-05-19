@@ -1,7 +1,14 @@
 import pytest
 
 from app.pipeline import model_client
-from app.pipeline.model_client import ModelCallError, enforce_free_model, is_placeholder_key, validate_openrouter_free_model
+from app.pipeline.model_client import (
+    ModelCallError,
+    default_max_tokens_for_model,
+    enforce_free_model,
+    is_placeholder_key,
+    retry_after_seconds,
+    validate_openrouter_free_model,
+)
 
 
 def test_placeholder_key_does_not_match_real_openrouter_prefix():
@@ -19,6 +26,25 @@ def test_free_only_gate_blocks_paid_models(monkeypatch):
 def test_free_only_gate_allows_openrouter_free_router(monkeypatch):
     monkeypatch.setattr(model_client.settings, "allow_paid_models", False)
     enforce_free_model("openrouter/free")
+
+
+def test_reasoning_models_get_larger_default_token_budget():
+    assert default_max_tokens_for_model("arcee-ai/trinity-large-thinking:free") == 4096
+    assert default_max_tokens_for_model("openai/gpt-oss-120b:free") is None
+
+
+def test_retry_after_parses_error_metadata_headers():
+    class Response:
+        headers = {"Retry-After": "9"}
+
+    assert retry_after_seconds(Response(), {}) == 9
+    assert retry_after_seconds(None, {
+        "error": {
+            "metadata": {
+                "retry_after_seconds_raw": 8.5,
+            }
+        }
+    }) == 8.5
 
 
 class FakeResponse:

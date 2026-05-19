@@ -14,6 +14,8 @@ from typing import Any
 import httpx
 
 from query_all_free_models import (
+    RequestPacer,
+    fetch_key_info,
     fetch_free_models,
     load_dotenv,
     probe_model,
@@ -306,17 +308,35 @@ def write_aggregate_markdown(aggregate: dict[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines))
 
 
-async def run_iteration(client: httpx.AsyncClient, key: str, iteration: int, concurrency: int, timeout: float, verbose_probes: bool) -> list[dict[str, Any]]:
+async def run_iteration(
+    client: httpx.AsyncClient,
+    key: str,
+    iteration: int,
+    concurrency: int,
+    timeout: float,
+    verbose_probes: bool,
+    request_spacing_seconds: float,
+    standard_max_tokens: int,
+    reasoning_max_tokens: int,
+    retry_on_rate_limit: bool,
+) -> list[dict[str, Any]]:
     started_at = utc_now()
     print(f"ACTION iteration_start iteration={iteration} started_at={started_at}")
     sem = asyncio.Semaphore(concurrency)
+    pacer = RequestPacer(request_spacing_seconds)
     if verbose_probes:
         free_models = await fetch_free_models(client, key)
-        results = await asyncio.gather(*(probe_model(client, key, model, sem, timeout) for model in free_models))
+        results = await asyncio.gather(*(
+            probe_model(client, key, model, sem, timeout, pacer, standard_max_tokens, reasoning_max_tokens, retry_on_rate_limit)
+            for model in free_models
+        ))
     else:
         with contextlib.redirect_stdout(io.StringIO()):
             free_models = await fetch_free_models(client, key)
-            results = await asyncio.gather(*(probe_model(client, key, model, sem, timeout) for model in free_models))
+            results = await asyncio.gather(*(
+                probe_model(client, key, model, sem, timeout, pacer, standard_max_tokens, reasoning_max_tokens, retry_on_rate_limit)
+                for model in free_models
+            ))
     completed_at = utc_now()
     enriched = [
         {
@@ -345,8 +365,12 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description="Run OpenRouter free model census repeatedly and aggregate results")
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--interval-seconds", type=float, default=60)
-    parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--timeout", type=float, default=20)
+    parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--timeout", type=float, default=90)
+    parser.add_argument("--request-spacing-seconds", type=float, default=3.1, help="Client-side pacing. 3.1s stays below OpenRouter's documented 20 RPM free-model limit.")
+    parser.add_argument("--standard-max-tokens", type=int, default=512)
+    parser.add_argument("--reasoning-max-tokens", type=int, default=0, help="Reasoning model budget. 0 uses the provider's advertised max completion cap when available, else 4096.")
+    parser.add_argument("--retry-on-rate-limit", action="store_true", help="Retry once after OpenRouter's Retry-After delay when supplied.")
     parser.add_argument("--run-id", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     parser.add_argument("--resume", action="store_true", help="Append to an existing run id and skip iterations already present in raw_calls.jsonl.")
     parser.add_argument("--verbose-probes", action="store_true", help="Print every per-model probe action/result. Raw JSONL is always written either way.")
@@ -374,6 +398,9 @@ async def main() -> int:
         print(f"Refusing to overwrite existing run data without --resume: {raw_path}", file=sys.stderr)
         return 2
 
+    async with httpx.AsyncClient(timeout=args.timeout) as client:
+        key_info = await fetch_key_info(client, key)
+
     manifest_path.write_text(json.dumps({
         "run_id": args.run_id,
         "created_at": utc_now(),
@@ -381,6 +408,11 @@ async def main() -> int:
         "interval_seconds": args.interval_seconds,
         "concurrency": args.concurrency,
         "timeout": args.timeout,
+        "request_spacing_seconds": args.request_spacing_seconds,
+        "standard_max_tokens": args.standard_max_tokens,
+        "reasoning_max_tokens": args.reasoning_max_tokens,
+        "retry_on_rate_limit": args.retry_on_rate_limit,
+        "openrouter_key_info": key_info,
         "resume": args.resume,
         "existing_iterations": sorted(seen_iterations),
         "raw_path": str(raw_path),
@@ -394,7 +426,12 @@ async def main() -> int:
                 print(f"ACTION skip_existing_iteration iteration={iteration}")
                 continue
             iteration_started = time.perf_counter()
-            records = await run_iteration(client, key, iteration, args.concurrency, args.timeout, args.verbose_probes)
+            records = await run_iteration(
+                client, key, iteration, args.concurrency, args.timeout,
+                args.verbose_probes, args.request_spacing_seconds,
+                args.standard_max_tokens, args.reasoning_max_tokens,
+                args.retry_on_rate_limit,
+            )
             append_jsonl(raw_path, records)
             aggregate = aggregate_records(read_jsonl(raw_path))
             aggregate_json_path.write_text(json.dumps(aggregate, indent=2))

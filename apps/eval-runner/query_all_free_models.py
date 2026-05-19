@@ -15,6 +15,23 @@ import httpx
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 PROMPT = "Free-tier census probe. Reply with exactly: SV_FREE_OK"
 EXPECTED = "SV_FREE_OK"
+REASONING_MARKERS = ("thinking", "reasoning", "reasoner", "r1", "o1", "o3", "glm-4.5")
+
+
+class RequestPacer:
+    def __init__(self, spacing_seconds: float) -> None:
+        self.spacing_seconds = max(0.0, spacing_seconds)
+        self._lock = asyncio.Lock()
+        self._next_at = 0.0
+
+    async def wait(self) -> None:
+        if self.spacing_seconds <= 0:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            if now < self._next_at:
+                await asyncio.sleep(self._next_at - now)
+            self._next_at = time.monotonic() + self.spacing_seconds
 
 
 def load_dotenv(path: Path) -> None:
@@ -39,6 +56,59 @@ def is_free_model(model: dict[str, Any]) -> bool:
 
 def provider(model_id: str) -> str:
     return model_id.split("/", 1)[0] if "/" in model_id else "unknown"
+
+
+def is_reasoning_model(model: dict[str, Any]) -> bool:
+    model_id = str(model.get("id", "")).lower()
+    name = str(model.get("name", "")).lower()
+    description = str(model.get("description", "")).lower()
+    return any(marker in value for marker in REASONING_MARKERS for value in (model_id, name, description))
+
+
+def provider_max_tokens(model: dict[str, Any]) -> int | None:
+    top_provider = model.get("top_provider") or {}
+    value = top_provider.get("max_completion_tokens") or top_provider.get("max_output_tokens")
+    try:
+        provider_limit = int(value) if value else None
+    except (TypeError, ValueError):
+        return None
+    try:
+        context_safe_limit = int(model.get("context_length", 0)) - 1024
+    except (TypeError, ValueError):
+        context_safe_limit = 0
+    if context_safe_limit > 0:
+        provider_limit = min(provider_limit, context_safe_limit) if provider_limit else context_safe_limit
+    return provider_limit
+
+
+def max_tokens_for_model(model: dict[str, Any], standard_max_tokens: int, reasoning_max_tokens: int) -> int:
+    provider_limit = provider_max_tokens(model)
+    if is_reasoning_model(model):
+        if provider_limit:
+            return provider_limit if reasoning_max_tokens <= 0 else min(reasoning_max_tokens, provider_limit)
+        return reasoning_max_tokens if reasoning_max_tokens > 0 else 4096
+    return min(standard_max_tokens, provider_limit) if provider_limit else standard_max_tokens
+
+
+def retry_after_seconds(response: httpx.Response | None, data: dict[str, Any] | None = None) -> float | None:
+    values: list[Any] = []
+    if response is not None:
+        values.append(response.headers.get("Retry-After"))
+    metadata = ((data or {}).get("error") or {}).get("metadata") if isinstance(data, dict) else None
+    if isinstance(metadata, dict):
+        values.extend([
+            metadata.get("retry_after_seconds"),
+            metadata.get("retry_after_seconds_raw"),
+            (metadata.get("headers") or {}).get("Retry-After") if isinstance(metadata.get("headers"), dict) else None,
+        ])
+    for value in values:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
 
 
 def anomaly_flags(model_id: str, status_code: int | None, content: str, cost: float, latency_ms: int, returned_model: str | None) -> list[str]:
@@ -79,20 +149,52 @@ async def fetch_free_models(client: httpx.AsyncClient, key: str) -> list[dict[st
     return free
 
 
-async def probe_model(client: httpx.AsyncClient, key: str, model: dict[str, Any], sem: asyncio.Semaphore, timeout: float) -> dict[str, Any]:
+async def fetch_key_info(client: httpx.AsyncClient, key: str) -> dict[str, Any]:
+    response = await client.get(f"{OPENROUTER_URL}/key", headers={"Authorization": f"Bearer {key}"})
+    if response.status_code != 200:
+        return {"status_code": response.status_code, "available": False}
+    payload = response.json()
+    data = payload.get("data", payload) if isinstance(payload, dict) else {}
+    if not isinstance(data, dict):
+        return {"status_code": response.status_code, "available": True}
+    allowed_keys = {
+        "label", "limit", "usage", "is_free_tier", "rate_limit", "free_model_requests",
+        "remaining", "requests", "interval", "daily_limit", "daily_usage",
+    }
+    return {
+        "status_code": response.status_code,
+        "available": True,
+        "data": {name: value for name, value in data.items() if name in allowed_keys},
+    }
+
+
+async def probe_model(
+    client: httpx.AsyncClient,
+    key: str,
+    model: dict[str, Any],
+    sem: asyncio.Semaphore,
+    timeout: float,
+    pacer: RequestPacer | None = None,
+    standard_max_tokens: int = 512,
+    reasoning_max_tokens: int = 4096,
+    retry_on_rate_limit: bool = False,
+) -> dict[str, Any]:
     model_id = model["id"]
     if not is_free_model(model):
         raise RuntimeError(f"Blocked non-free model: {model_id}")
     async with sem:
-        print(f"ACTION probe model={model_id} provider={provider(model_id)} context={model.get('context_length')} price_prompt=0 price_completion=0")
+        max_tokens = max_tokens_for_model(model, standard_max_tokens, reasoning_max_tokens)
+        print(f"ACTION probe model={model_id} provider={provider(model_id)} context={model.get('context_length')} max_tokens={max_tokens} reasoning={is_reasoning_model(model)} price_prompt=0 price_completion=0")
         started = time.perf_counter()
         payload = {
             "model": model_id,
             "messages": [{"role": "user", "content": PROMPT}],
-            "max_tokens": 16,
+            "max_tokens": max_tokens,
             "temperature": 0,
         }
         try:
+            if pacer:
+                await pacer.wait()
             response = await asyncio.wait_for(
                 client.post(
                     f"{OPENROUTER_URL}/chat/completions",
@@ -117,6 +219,39 @@ async def probe_model(client: httpx.AsyncClient, key: str, model: dict[str, Any]
             cost = float(usage.get("cost", usage.get("cost_details", {}).get("upstream_inference_cost", 0)) or 0)
             returned_model = data.get("model")
             flags = anomaly_flags(model_id, response.status_code, content, cost, latency_ms, returned_model)
+            retry_after = retry_after_seconds(response, data)
+            retry_attempted = False
+            if response.status_code == 429 and retry_on_rate_limit and retry_after:
+                retry_attempted = True
+                await asyncio.sleep(retry_after)
+                if pacer:
+                    await pacer.wait()
+                retry_started = time.perf_counter()
+                response = await asyncio.wait_for(
+                    client.post(
+                        f"{OPENROUTER_URL}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {key}",
+                            "Content-Type": "application/json",
+                            "HTTP-Referer": "https://systemvirtue.local",
+                            "X-Title": "System Virtue Free Model Census",
+                        },
+                        json=payload,
+                        timeout=timeout,
+                    ),
+                    timeout=timeout + 1,
+                )
+                latency_ms = int((time.perf_counter() - retry_started) * 1000)
+                try:
+                    data = response.json()
+                except Exception:
+                    data = {"raw": response.text}
+                content = data.get("choices", [{}])[0].get("message", {}).get("content") or ""
+                usage = data.get("usage", {})
+                cost = float(usage.get("cost", usage.get("cost_details", {}).get("upstream_inference_cost", 0)) or 0)
+                returned_model = data.get("model")
+                flags = anomaly_flags(model_id, response.status_code, content, cost, latency_ms, returned_model)
+                retry_after = retry_after_seconds(response, data)
             ok = response.status_code == 200 and EXPECTED in content and cost == 0
             print(f"RESULT probe model={model_id} status={response.status_code} ok={ok} latency_ms={latency_ms} cost={cost} anomalies={','.join(flags) or 'none'}")
             return {
@@ -132,6 +267,10 @@ async def probe_model(client: httpx.AsyncClient, key: str, model: dict[str, Any]
                 "usage": usage,
                 "cost": cost,
                 "anomalies": flags,
+                "max_tokens": max_tokens,
+                "reasoning_model": is_reasoning_model(model),
+                "retry_after_seconds": retry_after,
+                "retry_attempted": retry_attempted,
             }
         except (asyncio.TimeoutError, httpx.TimeoutException, httpx.NetworkError) as exc:
             latency_ms = int((time.perf_counter() - started) * 1000)
@@ -150,6 +289,10 @@ async def probe_model(client: httpx.AsyncClient, key: str, model: dict[str, Any]
                 "usage": {},
                 "cost": 0,
                 "anomalies": flags,
+                "max_tokens": max_tokens_for_model(model, standard_max_tokens, reasoning_max_tokens),
+                "reasoning_model": is_reasoning_model(model),
+                "retry_after_seconds": None,
+                "retry_attempted": False,
             }
 
 
@@ -210,7 +353,7 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
         "## Guardrails",
         "",
         "- Queried only models where OpenRouter `/models` reported `prompt=0`, `completion=0`, and model id ended with `:free`.",
-        "- Each call used `max_tokens=16` and an exact-response probe.",
+        "- Each call used a free-only exact-response probe. Reasoning/thinking models receive a larger token budget so hidden reasoning tokens do not consume the entire completion.",
         "- Any nonzero reported cost is flagged as an anomaly.",
         "",
         "## Summary",
@@ -255,8 +398,12 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Query every explicit OpenRouter :free model")
-    parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--request-spacing-seconds", type=float, default=3.1, help="Client-side pacing. 3.1s stays below OpenRouter's documented 20 RPM free-model limit.")
+    parser.add_argument("--standard-max-tokens", type=int, default=512)
+    parser.add_argument("--reasoning-max-tokens", type=int, default=0, help="Reasoning model budget. 0 uses the provider's advertised max completion cap when available, else 4096.")
+    parser.add_argument("--retry-on-rate-limit", action="store_true", help="Retry once after OpenRouter's Retry-After delay when supplied.")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[2]
@@ -270,9 +417,18 @@ async def main() -> int:
         return 2
 
     async with httpx.AsyncClient(timeout=args.timeout) as client:
+        key_info = await fetch_key_info(client, key)
         free_models = await fetch_free_models(client, key)
         sem = asyncio.Semaphore(args.concurrency)
-        results = await asyncio.gather(*(probe_model(client, key, model, sem, args.timeout) for model in free_models))
+        pacer = RequestPacer(args.request_spacing_seconds)
+        results = await asyncio.gather(*(
+            probe_model(
+                client, key, model, sem, args.timeout, pacer,
+                args.standard_max_tokens, args.reasoning_max_tokens,
+                args.retry_on_rate_limit,
+            )
+            for model in free_models
+        ))
 
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -280,6 +436,11 @@ async def main() -> int:
         "probe": PROMPT,
         "concurrency": args.concurrency,
         "timeout_seconds": args.timeout,
+        "request_spacing_seconds": args.request_spacing_seconds,
+        "standard_max_tokens": args.standard_max_tokens,
+        "reasoning_max_tokens": args.reasoning_max_tokens,
+        "retry_on_rate_limit": args.retry_on_rate_limit,
+        "openrouter_key_info": key_info,
         "results": sorted(results, key=lambda row: row["id"]),
     }
     report["summary"] = summarise(report["results"])
