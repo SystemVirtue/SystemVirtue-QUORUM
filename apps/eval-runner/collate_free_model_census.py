@@ -1,28 +1,34 @@
 import argparse
-import asyncio
-import contextlib
-import io
 import json
-import os
 import statistics
-import sys
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
-
-from query_all_free_models import (
-    fetch_free_models,
-    load_dotenv,
-    probe_model,
-    pctl,
-)
-
 
 def utc_now() -> str:
+    from datetime import datetime, timezone
+
     return datetime.now(timezone.utc).isoformat()
+
+
+def pctl(values: list[int], percentile: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, round((len(ordered) - 1) * percentile))
+    return ordered[idx]
+
+
+def latency_stats(values: list[int]) -> dict[str, Any]:
+    return {
+        "count": len(values),
+        "min": min(values) if values else None,
+        "mean": sum(values) / len(values) if values else None,
+        "median": statistics.median(values) if values else None,
+        "p90": pctl(values, 0.90),
+        "p95": pctl(values, 0.95),
+        "max": max(values) if values else None,
+    }
 
 
 def iqr_bounds(values: list[int]) -> tuple[float | None, float | None]:
@@ -44,20 +50,10 @@ def trimmed_mean(values: list[int], trim_ratio: float = 0.1) -> float | None:
     return sum(trimmed) / len(trimmed)
 
 
-def append_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
-    with path.open("a") as fh:
-        for record in records:
-            fh.write(json.dumps(record, sort_keys=True) + "\n")
-
-
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-
-
-def completed_iterations(records: list[dict[str, Any]]) -> set[int]:
-    return {int(record["iteration"]) for record in records if "iteration" in record}
 
 
 def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -96,9 +92,10 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         provider_row["attempts"] += 1
         model_row["iterations_seen"].add(record["iteration"])
         model_row["latencies_ms"].append(record["latency_ms"])
-        total_cost += float(record.get("cost") or 0)
-        model_row["cost"] += float(record.get("cost") or 0)
-        provider_row["cost"] += float(record.get("cost") or 0)
+        cost = float(record.get("cost") or 0)
+        total_cost += cost
+        model_row["cost"] += cost
+        provider_row["cost"] += cost
 
         status = str(record.get("status_code"))
         status_counts[status] = status_counts.get(status, 0) + 1
@@ -122,7 +119,7 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     all_success_latencies = [record["latency_ms"] for record in records if record["ok"]]
     lower, upper = iqr_bounds(all_success_latencies)
     global_outliers = [
-        {"iteration": r["iteration"], "id": r["id"], "latency_ms": r["latency_ms"]}
+        {"iteration": r["iteration"], "id": r["id"], "latency_ms": r["latency_ms"], "source_run_id": r.get("source_run_id")}
         for r in records
         if r["ok"] and lower is not None and upper is not None and (r["latency_ms"] < lower or r["latency_ms"] > upper)
     ]
@@ -195,22 +192,6 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             model_summary.items(),
             key=lambda item: (-item[1]["anomaly_counts"].get("rate_limited", 0), item[0]),
         )[:15],
-        "most_anomalous_models": sorted(
-            model_summary.items(),
-            key=lambda item: (-sum(item[1]["anomaly_counts"].values()), item[0]),
-        )[:15],
-    }
-
-
-def latency_stats(values: list[int]) -> dict[str, Any]:
-    return {
-        "count": len(values),
-        "min": min(values) if values else None,
-        "mean": sum(values) / len(values) if values else None,
-        "median": statistics.median(values) if values else None,
-        "p90": pctl(values, 0.90),
-        "p95": pctl(values, 0.95),
-        "max": max(values) if values else None,
     }
 
 
@@ -223,6 +204,7 @@ def write_aggregate_markdown(aggregate: dict[str, Any], path: Path) -> None:
         "## Summary",
         "",
         f"- Completed iterations: `{aggregate['iteration_count']}`",
+        f"- Source-aware sampled cycles: `{aggregate.get('source_iteration_count', aggregate['iteration_count'])}`",
         f"- Calls logged: `{aggregate['calls']}`",
         f"- Successes: `{aggregate['successes']}`",
         f"- Success rate: `{aggregate['success_rate']:.2%}`",
@@ -245,145 +227,57 @@ def write_aggregate_markdown(aggregate: dict[str, Any], path: Path) -> None:
             f"`{row['success_latency_ms']['median']}` | `{row['success_latency_trimmed_mean_ms']}` | "
             f"`{json.dumps(row['anomaly_counts'], sort_keys=True)}` |"
         )
-    lines.extend([
-        "",
-        "## Fastest Reliable Models",
-        "",
-        "| Model | Attempts | Successes | Success Rate | Trimmed Mean ms | Median ms |",
-        "|---|---:|---:|---:|---:|---:|",
-    ])
+    lines.extend(["", "## Fastest Reliable Models", "", "| Model | Attempts | Successes | Success Rate | Trimmed Mean ms | Median ms |", "|---|---:|---:|---:|---:|---:|"])
     for model_id, row in aggregate["top_models_by_trimmed_latency"]:
         lines.append(
             f"| `{model_id}` | `{row['attempts']}` | `{row['successes']}` | `{row['success_rate']:.2%}` | "
             f"`{row['success_latency_trimmed_mean_ms']}` | `{row['success_latency_ms']['median']}` |"
         )
-    lines.extend([
-        "",
-        "## Most Rate Limited",
-        "",
-        "| Model | Attempts | Rate Limits | Success Rate |",
-        "|---|---:|---:|---:|",
-    ])
+    lines.extend(["", "## Most Rate Limited", "", "| Model | Attempts | Rate Limits | Success Rate |", "|---|---:|---:|---:|"])
     for model_id, row in aggregate["most_rate_limited_models"]:
         lines.append(f"| `{model_id}` | `{row['attempts']}` | `{row['anomaly_counts'].get('rate_limited', 0)}` | `{row['success_rate']:.2%}` |")
-    lines.extend([
-        "",
-        "## Provider Summary",
-        "",
-        "| Provider | Attempts | Successes | Success Rate | Median Success Latency ms | Anomalies |",
-        "|---|---:|---:|---:|---:|---|",
-    ])
-    for provider, row in aggregate["providers"].items():
-        lines.append(
-            f"| `{provider}` | `{row['attempts']}` | `{row['successes']}` | `{row['success_rate']:.2%}` | "
-            f"`{row['success_latency_ms']['median']}` | `{json.dumps(row['anomaly_counts'], sort_keys=True)}` |"
-        )
     path.write_text("\n".join(lines))
 
 
-async def run_iteration(client: httpx.AsyncClient, key: str, iteration: int, concurrency: int, timeout: float, verbose_probes: bool) -> list[dict[str, Any]]:
-    started_at = utc_now()
-    print(f"ACTION iteration_start iteration={iteration} started_at={started_at}")
-    sem = asyncio.Semaphore(concurrency)
-    if verbose_probes:
-        free_models = await fetch_free_models(client, key)
-        results = await asyncio.gather(*(probe_model(client, key, model, sem, timeout) for model in free_models))
-    else:
-        with contextlib.redirect_stdout(io.StringIO()):
-            free_models = await fetch_free_models(client, key)
-            results = await asyncio.gather(*(probe_model(client, key, model, sem, timeout) for model in free_models))
-    completed_at = utc_now()
-    enriched = [
-        {
-            **result,
-            "iteration": iteration,
-            "iteration_started_at": started_at,
-            "iteration_completed_at": completed_at,
-        }
-        for result in results
-    ]
-    anomaly_counts: dict[str, int] = {}
-    for row in enriched:
-        for anomaly in row.get("anomalies", []):
-            anomaly_counts[anomaly] = anomaly_counts.get(anomaly, 0) + 1
-    print(
-        f"RESULT iteration_complete iteration={iteration} calls={len(enriched)} "
-        f"successes={sum(1 for r in enriched if r['ok'])} "
-        f"cost={sum(float(r.get('cost') or 0) for r in enriched):.2f} "
-        f"anomalies={json.dumps(dict(sorted(anomaly_counts.items())), sort_keys=True)} "
-        f"completed_at={completed_at}"
-    )
-    return enriched
+def load_records(series_dirs: list[Path]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for series_dir in series_dirs:
+        raw_path = series_dir / "raw_calls.jsonl"
+        if not raw_path.exists():
+            raise FileNotFoundError(f"Missing raw census file: {raw_path}")
+        for record in read_jsonl(raw_path):
+            records.append({**record, "source_run_id": series_dir.name})
+    return records
 
 
-async def main() -> int:
-    parser = argparse.ArgumentParser(description="Run OpenRouter free model census repeatedly and aggregate results")
-    parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--interval-seconds", type=float, default=60)
-    parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--timeout", type=float, default=20)
-    parser.add_argument("--run-id", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
-    parser.add_argument("--resume", action="store_true", help="Append to an existing run id and skip iterations already present in raw_calls.jsonl.")
-    parser.add_argument("--verbose-probes", action="store_true", help="Print every per-model probe action/result. Raw JSONL is always written either way.")
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Collate one or more OpenRouter free model census series into one aggregate report")
+    parser.add_argument("series_dirs", nargs="+", type=Path)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--run-id", default=f"collated_free_census_{utc_now().replace(':', '').replace('-', '')}")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[2]
-    load_dotenv(root / ".env")
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if not key or key == "sk-or-your-key-here":
-        print("OPENROUTER_API_KEY is missing", file=sys.stderr)
-        return 2
-    if os.environ.get("ALLOW_PAID_MODELS", "false").lower() != "false":
-        print("Refusing to run: ALLOW_PAID_MODELS must be false", file=sys.stderr)
-        return 2
+    output_dir = args.output_dir or root / "benchmarks" / "series" / args.run_id
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    out_dir = root / "benchmarks" / "series" / args.run_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = out_dir / "raw_calls.jsonl"
-    aggregate_json_path = out_dir / "aggregate.json"
-    aggregate_md_path = out_dir / "aggregate.md"
-    manifest_path = out_dir / "manifest.json"
-    existing_records = read_jsonl(raw_path) if args.resume else []
-    seen_iterations = completed_iterations(existing_records)
-    if raw_path.exists() and not args.resume and raw_path.stat().st_size > 0:
-        print(f"Refusing to overwrite existing run data without --resume: {raw_path}", file=sys.stderr)
-        return 2
+    records = load_records(args.series_dirs)
+    aggregate = aggregate_records(records)
+    aggregate["source_run_ids"] = [path.name for path in args.series_dirs]
+    aggregate["source_iteration_count"] = len({(record.get("source_run_id"), record.get("iteration")) for record in records})
+    aggregate["collated_at"] = utc_now()
 
-    manifest_path.write_text(json.dumps({
-        "run_id": args.run_id,
-        "created_at": utc_now(),
-        "iterations": args.iterations,
-        "interval_seconds": args.interval_seconds,
-        "concurrency": args.concurrency,
-        "timeout": args.timeout,
-        "resume": args.resume,
-        "existing_iterations": sorted(seen_iterations),
-        "raw_path": str(raw_path),
-        "aggregate_json_path": str(aggregate_json_path),
-        "aggregate_md_path": str(aggregate_md_path),
-    }, indent=2))
+    aggregate_json_path = output_dir / "aggregate.json"
+    aggregate_md_path = output_dir / "aggregate.md"
+    raw_path = output_dir / "raw_calls.jsonl"
 
-    async with httpx.AsyncClient(timeout=args.timeout) as client:
-        for iteration in range(1, args.iterations + 1):
-            if iteration in seen_iterations:
-                print(f"ACTION skip_existing_iteration iteration={iteration}")
-                continue
-            iteration_started = time.perf_counter()
-            records = await run_iteration(client, key, iteration, args.concurrency, args.timeout, args.verbose_probes)
-            append_jsonl(raw_path, records)
-            aggregate = aggregate_records(read_jsonl(raw_path))
-            aggregate_json_path.write_text(json.dumps(aggregate, indent=2))
-            write_aggregate_markdown(aggregate, aggregate_md_path)
-            print(f"RESULT aggregate_updated iteration={iteration} aggregate={aggregate_json_path} markdown={aggregate_md_path}")
-            if iteration < args.iterations:
-                elapsed = time.perf_counter() - iteration_started
-                sleep_for = max(0, args.interval_seconds - elapsed)
-                print(f"ACTION sleep_until_next_iteration seconds={sleep_for:.2f}")
-                await asyncio.sleep(sleep_for)
+    raw_path.write_text("\n".join(json.dumps(record, sort_keys=True) for record in records) + "\n")
+    aggregate_json_path.write_text(json.dumps(aggregate, indent=2))
+    write_aggregate_markdown(aggregate, aggregate_md_path)
 
-    print(f"RESULT scheduled_census_complete run_id={args.run_id} aggregate={aggregate_md_path}")
+    print(f"RESULT collated_census source_runs={len(args.series_dirs)} calls={len(records)} output={aggregate_md_path}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    raise SystemExit(main())

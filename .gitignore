@@ -29,6 +29,7 @@ benchmarks/runs/*.json
 benchmarks/reports/*.json
 benchmarks/reports/*.md
 benchmarks/series/
+seed/free_model_census_health.json
 
 # Logs
 *.log

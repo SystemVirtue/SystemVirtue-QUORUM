@@ -20,6 +20,7 @@ class FreeModelRegistry:
 
     def __init__(self) -> None:
         self._cache: list[FreeModel] | None = None
+        self._health_snapshot: dict[str, Any] | None = None
 
     async def refresh(self) -> list[FreeModel]:
         if not settings.openrouter_api_key or settings.openrouter_api_key == "sk-or-your-key-here":
@@ -57,8 +58,9 @@ class FreeModelRegistry:
         model_id = raw["id"]
         family = model_id.split(":")[0].split("/")[-1].replace("-instruct", "")
         seed = self._seed_for(model_id)
-        telemetry = ModelTelemetry()
-        health = compute_health(telemetry, int(raw.get("context_length", 0)), 8192)
+        census = self._census_health_for(model_id)
+        telemetry = ModelTelemetry.model_validate(census["telemetry"]) if census else ModelTelemetry()
+        health = float(census["health_score"]) if census else compute_health(telemetry, int(raw.get("context_length", 0)), 8192)
         return FreeModel(
             id=model_id,
             family=family,
@@ -68,7 +70,7 @@ class FreeModelRegistry:
             capabilities=seed,
             telemetry=telemetry,
             health_score=health,
-            last_verified=datetime.now(timezone.utc).isoformat(),
+            last_verified=(census.get("generated_at") if census else datetime.now(timezone.utc).isoformat()),
         )
 
     def _seed_for(self, model_id: str) -> ModelCapabilities:
@@ -85,6 +87,14 @@ class FreeModelRegistry:
             synthesis=6.5, json_reliability=7.0, model_class=model_class,
             generic={"coding": 6.8, "reasoning": 7.0, "critique": 6.5, "synthesis": 6.5, "json_reliability": 7.0, "long_context": 6.5},
         )
+
+    def _census_health_for(self, model_id: str) -> dict[str, Any] | None:
+        if self._health_snapshot is None:
+            path = Path(__file__).resolve().parents[4] / "seed" / "free_model_census_health.json"
+            self._health_snapshot = json.loads(path.read_text()) if path.exists() else {}
+        models = self._health_snapshot.get("models", {})
+        row = models.get(model_id)
+        return row if isinstance(row, dict) else None
 
     def seed_pool(self) -> list[FreeModel]:
         ids = [

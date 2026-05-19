@@ -35,6 +35,46 @@ Outputs under `benchmarks/series/<run-id>/`:
 
 By default, scheduled runs print one summary line per iteration and store per-call details in `raw_calls.jsonl`. Add `--verbose-probes` only for short debugging runs; printing every model call can create terminal backpressure and distort one-minute cadence.
 
+To resume an interrupted run without duplicating completed iterations:
+
+```bash
+python apps/eval-runner/scheduled_free_model_census.py \
+  --iterations 100 \
+  --interval-seconds 60 \
+  --concurrency 8 \
+  --timeout 20 \
+  --run-id <existing-run-id> \
+  --resume
+```
+
+The runner refuses to append to an existing non-empty `raw_calls.jsonl` unless `--resume` is provided.
+
+## Collating Partial Runs
+
+To combine multiple scheduled census folders into one aggregate:
+
+```bash
+python apps/eval-runner/collate_free_model_census.py \
+  benchmarks/series/free_census_partial_a \
+  benchmarks/series/free_census_partial_b \
+  --run-id collated_free_census
+```
+
+The collator writes a merged `raw_calls.jsonl`, `aggregate.json`, and `aggregate.md` under `benchmarks/series/<run-id>/`.
+
+## Exporting Registry Health
+
+To make the orchestrator use observed census availability, latency, rate-limit, timeout, and malformed-output data during free-model selection:
+
+```bash
+python apps/eval-runner/export_census_health.py \
+  benchmarks/series/<run-id>/aggregate.json
+```
+
+This writes `seed/free_model_census_health.json`, which is intentionally git-ignored because it is local live telemetry. When present, the orchestrator registry overlays this snapshot onto live OpenRouter `/models` discovery; when absent, it falls back to seeded defaults.
+
+For selection health, `availability_24h` is exported as usable exact-probe success rate, not raw HTTP-200 rate. The raw HTTP availability is preserved under each model's `source.http_availability_rate`, but empty or instruction-breaking outputs must not make a model look council-ready.
+
 ## Guardrails
 
 - Requires `ALLOW_PAID_MODELS=false`.
