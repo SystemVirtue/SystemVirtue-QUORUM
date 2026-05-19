@@ -33,6 +33,8 @@ Outputs under `benchmarks/series/<run-id>/`:
 - `aggregate.json`: current aggregate after each iteration
 - `aggregate.md`: human-readable aggregate after each iteration
 
+By default, scheduled runs print one summary line per iteration and store per-call details in `raw_calls.jsonl`. Add `--verbose-probes` only for short debugging runs; printing every model call can create terminal backpressure and distort one-minute cadence.
+
 ## Guardrails
 
 - Requires `ALLOW_PAID_MODELS=false`.

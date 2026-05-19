@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import contextlib
+import io
 import json
 import os
 import statistics
@@ -275,12 +277,17 @@ def write_aggregate_markdown(aggregate: dict[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines))
 
 
-async def run_iteration(client: httpx.AsyncClient, key: str, iteration: int, concurrency: int, timeout: float) -> list[dict[str, Any]]:
+async def run_iteration(client: httpx.AsyncClient, key: str, iteration: int, concurrency: int, timeout: float, verbose_probes: bool) -> list[dict[str, Any]]:
     started_at = utc_now()
     print(f"ACTION iteration_start iteration={iteration} started_at={started_at}")
-    free_models = await fetch_free_models(client, key)
     sem = asyncio.Semaphore(concurrency)
-    results = await asyncio.gather(*(probe_model(client, key, model, sem, timeout) for model in free_models))
+    if verbose_probes:
+        free_models = await fetch_free_models(client, key)
+        results = await asyncio.gather(*(probe_model(client, key, model, sem, timeout) for model in free_models))
+    else:
+        with contextlib.redirect_stdout(io.StringIO()):
+            free_models = await fetch_free_models(client, key)
+            results = await asyncio.gather(*(probe_model(client, key, model, sem, timeout) for model in free_models))
     completed_at = utc_now()
     enriched = [
         {
@@ -291,7 +298,17 @@ async def run_iteration(client: httpx.AsyncClient, key: str, iteration: int, con
         }
         for result in results
     ]
-    print(f"RESULT iteration_complete iteration={iteration} calls={len(enriched)} successes={sum(1 for r in enriched if r['ok'])} completed_at={completed_at}")
+    anomaly_counts: dict[str, int] = {}
+    for row in enriched:
+        for anomaly in row.get("anomalies", []):
+            anomaly_counts[anomaly] = anomaly_counts.get(anomaly, 0) + 1
+    print(
+        f"RESULT iteration_complete iteration={iteration} calls={len(enriched)} "
+        f"successes={sum(1 for r in enriched if r['ok'])} "
+        f"cost={sum(float(r.get('cost') or 0) for r in enriched):.2f} "
+        f"anomalies={json.dumps(dict(sorted(anomaly_counts.items())), sort_keys=True)} "
+        f"completed_at={completed_at}"
+    )
     return enriched
 
 
@@ -302,6 +319,7 @@ async def main() -> int:
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=20)
     parser.add_argument("--run-id", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+    parser.add_argument("--verbose-probes", action="store_true", help="Print every per-model probe action/result. Raw JSONL is always written either way.")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[2]
@@ -335,7 +353,7 @@ async def main() -> int:
     async with httpx.AsyncClient(timeout=args.timeout) as client:
         for iteration in range(1, args.iterations + 1):
             iteration_started = time.perf_counter()
-            records = await run_iteration(client, key, iteration, args.concurrency, args.timeout)
+            records = await run_iteration(client, key, iteration, args.concurrency, args.timeout, args.verbose_probes)
             append_jsonl(raw_path, records)
             aggregate = aggregate_records(read_jsonl(raw_path))
             aggregate_json_path.write_text(json.dumps(aggregate, indent=2))
