@@ -1,13 +1,12 @@
 import argparse
 import json
 import statistics
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 def utc_now() -> str:
-    from datetime import datetime, timezone
-
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -54,6 +53,25 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def iteration_wall_spans(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    spans: dict[tuple[Any, int], tuple[str, str]] = {}
+    for record in records:
+        started = record.get("iteration_started_at")
+        completed = record.get("iteration_completed_at")
+        if started and completed:
+            spans[(record.get("source_run_id"), int(record["iteration"]))] = (started, completed)
+    durations: list[dict[str, Any]] = []
+    for key, (started, completed) in spans.items():
+        start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        completed_dt = datetime.fromisoformat(completed.replace("Z", "+00:00"))
+        durations.append({
+            "source_run_id": key[0],
+            "iteration": key[1],
+            "duration_seconds": (completed_dt - start_dt).total_seconds(),
+        })
+    return durations
 
 
 def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -164,6 +182,8 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         }
 
     completed_iterations = sorted({record["iteration"] for record in records})
+    wall_spans = iteration_wall_spans(records)
+    wall_durations = [int(row["duration_seconds"]) for row in wall_spans]
     return {
         "generated_at": utc_now(),
         "completed_iterations": completed_iterations,
@@ -178,6 +198,8 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "success_latency_trimmed_mean_ms": trimmed_mean(all_success_latencies),
         "success_latency_outlier_bounds_ms": {"lower": lower, "upper": upper},
         "success_latency_outliers": global_outliers,
+        "iteration_wall_duration_seconds": latency_stats(wall_durations),
+        "iteration_wall_overruns": [row for row in wall_spans if row["duration_seconds"] > 90],
         "models": dict(sorted(model_summary.items())),
         "providers": dict(sorted(provider_summary.items())),
         "top_models_by_success_rate": sorted(
@@ -215,6 +237,8 @@ def write_aggregate_markdown(aggregate: dict[str, Any], path: Path) -> None:
         f"- Success latency p95: `{aggregate['success_latency_ms']['p95']}` ms",
         f"- Success latency trimmed mean: `{aggregate['success_latency_trimmed_mean_ms']}` ms",
         f"- Success latency outliers: `{len(aggregate['success_latency_outliers'])}`",
+        f"- Iteration wall duration p95: `{aggregate['iteration_wall_duration_seconds']['p95']}` seconds",
+        f"- Iteration wall overruns >90s: `{len(aggregate['iteration_wall_overruns'])}`",
         "",
         "## Top Models By Success Rate",
         "",
