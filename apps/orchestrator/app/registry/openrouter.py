@@ -27,8 +27,16 @@ class FreeModelRegistry:
             return self._cache
 
         headers = {"Authorization": f"Bearer {settings.openrouter_api_key}"}
-        async with httpx.AsyncClient(timeout=20) as client:
-            data = (await client.get(f"{settings.openrouter_base_url}/models", headers=headers)).json()["data"]
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.get(f"{settings.openrouter_base_url}/models", headers=headers)
+                response.raise_for_status()
+                data = response.json()["data"]
+        except Exception:
+            if self._cache:
+                return self._cache
+            self._cache = self.seed_pool()
+            return self._cache
         free = [
             m for m in data
             if float(m.get("pricing", {}).get("prompt", 1)) == 0

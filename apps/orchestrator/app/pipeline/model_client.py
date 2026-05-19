@@ -3,6 +3,10 @@ import time
 import httpx
 from app.core.config import settings
 
+FREE_MODEL_CACHE_TTL_SECONDS = 600
+_free_model_cache: set[str] | None = None
+_free_model_cache_checked_at = 0.0
+
 
 class ModelCallError(Exception):
     def __init__(self, reason: str, status_code: int | None = None, latency_ms: int = 0, cost: float = 0.0) -> None:
@@ -24,6 +28,31 @@ def enforce_free_model(model: str) -> None:
         return
     if not model.endswith(":free"):
         raise ModelCallError(f"blocked_non_free_model:{model}")
+
+
+async def validate_openrouter_free_model(model: str, client: httpx.AsyncClient) -> None:
+    global _free_model_cache, _free_model_cache_checked_at
+    if settings.allow_paid_models or model == "openrouter/free":
+        return
+    now = time.monotonic()
+    if _free_model_cache is None or now - _free_model_cache_checked_at > FREE_MODEL_CACHE_TTL_SECONDS:
+        response = await client.get(
+            f"{settings.openrouter_base_url}/models",
+            headers={"Authorization": f"Bearer {settings.openrouter_api_key}"},
+        )
+        if response.status_code != 200:
+            raise ModelCallError("free_model_pricing_validation_failed", response.status_code)
+        data = response.json().get("data", [])
+        _free_model_cache = {
+            item["id"]
+            for item in data
+            if float(item.get("pricing", {}).get("prompt", 1)) == 0
+            and float(item.get("pricing", {}).get("completion", 1)) == 0
+            and str(item.get("id", "")).endswith(":free")
+        }
+        _free_model_cache_checked_at = now
+    if model not in _free_model_cache:
+        raise ModelCallError(f"blocked_model_not_in_live_free_pool:{model}")
 
 
 async def call_model(model: str, messages: list[dict], timeout: float = 30.0, max_tokens: int | None = None) -> tuple[str, int, float, dict]:
@@ -53,6 +82,7 @@ async def call_model(model: str, messages: list[dict], timeout: float = 30.0, ma
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
     async with httpx.AsyncClient(timeout=timeout) as client:
+        await validate_openrouter_free_model(model, client)
         response = await client.post(f"{settings.openrouter_base_url}/chat/completions", json=payload, headers=headers)
         latency_ms = int((time.perf_counter() - started) * 1000)
         try:
